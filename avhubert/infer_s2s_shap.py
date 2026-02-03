@@ -371,12 +371,48 @@ def main(cfg: DictConfig):
         'WER': total_wer / num_processed
     })
 
-
-@hydra.main(config_path="conf", config_name="s2s_decode")
-def hydra_main(cfg: DictConfig):
+config_path = Path(__file__).resolve().parent / "conf"
+@hydra.main(config_path=str(config_path), config_name="s2s_decode")
+def hydra_main(cfg: InferConfig) -> None:
     """Hydra entry point."""
-    main(cfg)
+    from hydra.core.config_store import ConfigStore
+    from dataclasses import is_dataclass
+    
+    container = OmegaConf.to_container(cfg, resolve=True, enum_to_str=True)
+    cfg = OmegaConf.create(container)
+    OmegaConf.set_struct(cfg, True)
+    
+    try:
+        main(cfg)
+    except Exception as e:
+        logger.error(f"Error: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
+
+
+def cli_main() -> None:
+    """CLI entry point with ConfigStore setup."""
+    from hydra.core.config_store import ConfigStore
+    from dataclasses import is_dataclass
+    
+    try:
+        from hydra._internal.utils import get_args
+        cfg_name = get_args().config_name or "s2s_decode"
+    except ImportError:
+        logger.warning("Failed to get config name from hydra args")
+        cfg_name = "s2s_decode"
+    
+    cs = ConfigStore.instance()
+    cs.store(name=cfg_name, node=InferConfig)
+    
+    for k in InferConfig.__dataclass_fields__:
+        if is_dataclass(InferConfig.__dataclass_fields__[k].type):
+            v = InferConfig.__dataclass_fields__[k].default
+            cs.store(name=k, node=v)
+    
+    hydra_main()
 
 
 if __name__ == "__main__":
-    hydra_main()
+    cli_main()
