@@ -1,0 +1,320 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Tue Feb  3 16:53:55 2026
+
+@author: umbertocappellazzo
+"""
+
+# Copyright (c) Facebook, Inc. and its affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the license found in the
+# LICENSE file in the root directory of this source tree.
+
+"""
+SHAP analysis inference script for AV-HuBERT.
+
+This script runs SHAP analysis to measure audio vs video modality contributions
+in the AV-HuBERT model for audio-visual speech recognition.
+
+Usage:
+    python infer_s2s_shap.py --config-dir /path/to/conf --config-name s2s_decode \
+        common.user_dir=/path/to/avhubert \
+        override.data=/path/to/data \
+        override.modalities=['audio','video'] \
+        --num-samples-shap 2000 \
+        --wandb-project avhubert-shap \
+"""
+
+import os
+import sys
+import logging
+import math
+import time
+from dataclasses import dataclass, field
+from typing import Optional, List
+from pathlib import Path
+
+import numpy as np
+import torch
+import hydra
+from omegaconf import DictConfig, OmegaConf
+import editdistance
+
+import wandb
+
+from fairseq import checkpoint_utils, options, tasks, utils
+from fairseq.dataclass.configs import FairseqConfig
+from fairseq.logging import progress_bar
+
+# Import SHAP utilities
+from vhubert_shap import (
+    forward_shap_avhubert,
+    run_sanity_checks,
+    extract_features_separate,
+    generate_baseline_greedy,
+)
+
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    level=os.environ.get("LOGLEVEL", "INFO").upper(),
+    stream=sys.stdout,
+)
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class InferConfig(FairseqConfig):
+    """Configuration for SHAP inference."""
+    pass
+
+
+def get_symbols_to_strip_from_output(generator):
+    """Get symbols to strip from decoder output."""
+    if hasattr(generator, "symbols_to_strip_from_output"):
+        return generator.symbols_to_strip_from_output
+    else:
+        return {generator.eos, generator.pad}
+
+
+def decode_fn(x, tgt_dict):
+    """Decode token indices to string."""
+    # Filter out special tokens
+    tokens = []
+    for tok in x:
+        if tok not in [tgt_dict.bos(), tgt_dict.eos(), tgt_dict.pad()]:
+            tokens.append(tok)
+    return tgt_dict.string(torch.tensor(tokens))
+
+
+def compute_wer(hyp: str, ref: str) -> float:
+    """Compute Word Error Rate."""
+    hyp_words = hyp.split()
+    ref_words = ref.split()
+    if len(ref_words) == 0:
+        return 0.0 if len(hyp_words) == 0 else 100.0
+    return 100 * editdistance.eval(hyp_words, ref_words) / len(ref_words)
+
+
+def main(cfg: DictConfig):
+    """Main SHAP analysis function."""
+    
+    # Parse additional arguments from command line
+    import argparse
+    parser = argparse.ArgumentParser(description='SHAP analysis for AV-HuBERT')
+    parser.add_argument('--num-samples-shap', type=int, default=2000,
+                        help='Number of SHAP samples per evaluation')
+    parser.add_argument('--max-samples', type=int, default=None,
+                        help='Maximum number of samples to process')
+    parser.add_argument('--wandb-project', default=None, type=str, 
+                        help='WandB project name (if None, WandB disabled)')
+    parser.add_argument('--exp-name', default=None, type=str,
+                        help='WandB run name (auto-generated if None)')
+    parser.add_argument('--run-sanity-check', action='store_true',
+                        help='Run sanity checks on first sample')
+    parser.add_argument('--save-raw-shap', action='store_true',
+                        help='Save raw SHAP values for each sample')
+    
+    # Parse only known args since Hydra handles the rest
+    args, unknown = parser.parse_known_args()
+    
+    wandb.init(
+        project=args.wandb_project,
+        name=args.exp_name,
+    )
+    logger.info(f"WandB initialized: {args.wandb_project}")
+    
+    # Setup task and model
+    if cfg.common.user_dir:
+        utils.import_user_module(cfg.common)
+    
+    logger.info(f"Loading model from: {cfg.common_eval.path}")
+    
+    # Set modalities
+    if hasattr(cfg, 'override') and hasattr(cfg.override, 'modalities'):
+        modalities = list(cfg.override.modalities)
+    else:
+        modalities = ['audio', 'video']
+    
+    logger.info(f"Using modalities: {modalities}")
+    
+    # Load model ensemble and task
+    models, saved_cfg, task = checkpoint_utils.load_model_ensemble_and_task(
+        [cfg.common_eval.path],
+        arg_overrides={'modalities': modalities},
+        strict=False,
+    )
+    
+    model = models[0]
+    model.eval()
+    
+    # Move to GPU if available
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = model.to(device)
+    logger.info(f"Model loaded on device: {device}")
+    
+    # Get dictionaries
+    tgt_dict = task.target_dictionary
+    bos_idx = tgt_dict.bos()
+    eos_idx = tgt_dict.eos()
+    pad_idx = tgt_dict.pad()
+    
+    logger.info(f"Vocabulary size: {len(tgt_dict)}")
+    logger.info(f"BOS idx: {bos_idx}, EOS idx: {eos_idx}, PAD idx: {pad_idx}")
+    
+    # Load dataset
+    task.load_dataset(cfg.dataset.gen_subset)
+    dataset = task.dataset(cfg.dataset.gen_subset)
+    
+    logger.info(f"Dataset loaded: {len(dataset)} samples")
+    
+    # Limit samples if specified
+    num_samples = len(dataset)
+    if args.max_samples is not None:
+        num_samples = min(num_samples, args.max_samples)
+    
+    logger.info(f"Processing {num_samples} samples with {args.num_samples_shap} SHAP samples each")
+    
+    results = {
+        'audio_abs': [],
+        'video_abs': [],
+        'audio_pos': [],
+        'video_pos': [],
+        'audio_neg': [],
+        'video_neg': [],
+        'num_audio_tokens': [],
+        'shapley_values': [],
+    }
+    total_wer = 0.
+    num_processed = 0
+    
+    # Process samples one by one (SHAP requires batch_size=1)
+    for sample_idx in range(num_samples):
+        try:
+            # Get sample
+            sample = dataset[sample_idx]
+            
+            # Collate single sample
+            batch = dataset.collater([sample])
+            
+            # Move to device
+            batch = utils.move_to_cuda(batch) if device.type == 'cuda' else batch
+            
+            # Extract source and target
+            source = batch['net_input']['source']
+            padding_mask = batch['net_input'].get('padding_mask', None)
+            target_tokens = batch.get('target', None)
+            
+            # Get reference text if available
+            if target_tokens is not None:
+                ref_text = decode_fn(target_tokens[0], tgt_dict)
+            else:
+                ref_text = ""
+            
+            # Run sanity check on first sample if requested
+            if args.run_sanity_check and sample_idx == 0:
+                logger.info("Running sanity checks...")
+                sanity_results = run_sanity_checks(
+                    model, source, padding_mask, bos_idx, eos_idx
+                )
+                logger.info(f"Sanity check results: {sanity_results}")
+            
+            # Run SHAP analysis
+            
+            (audio_abs, video_abs,
+             audio_pos, video_pos,
+             audio_neg, video_neg,
+             shapley_values, baseline_tokens) = forward_shap_avhubert(
+                model,
+                source,
+                padding_mask,
+                bos_idx,
+                eos_idx,
+                n_shap_samples=args.num_samples_shap,
+            )
+            
+            # Get baseline transcription
+            hyp_text = decode_fn(torch.tensor(baseline_tokens), tgt_dict) if len(baseline_tokens) > 0 else ""
+            
+            # Compute WER
+            wer = compute_wer(hyp_text, ref_text)
+            total_wer += wer
+            num_processed += 1
+            
+            # Store results
+            results['audio_abs'].append(audio_abs)
+            results['video_abs'].append(video_abs)
+            results['audio_pos'].append(audio_pos)
+            results['video_pos'].append(video_pos)
+            results['audio_neg'].append(audio_neg)
+            results['video_neg'].append(video_neg)
+            results['shapley_values'].append(shapley_values)
+            
+            wandb.log({
+                'sample_idx': sample_idx,
+                'sample_audio_abs': audio_abs,
+                'sample_video_abs': video_abs,
+                'sample_audio_pos': audio_pos,
+                'sample_video_pos': video_pos,
+                'sample_audio_neg': audio_neg,
+                'sample_video_neg': video_neg,
+            })
+            
+        
+        except Exception as e:
+            logger.error(f"Error processing sample {sample_idx}: {e}")
+            import traceback
+            traceback.print_exc()
+            continue
+    
+    # Compute aggregate statistics
+    print("\n" + "="*80)
+    print("SHAP Analysis Complete")
+    print("="*80)
+ 
+    mean_audio_abs = np.mean(results['audio_abs'])
+    mean_video_abs = np.mean(results['video_abs'])
+    mean_audio_pos = np.mean(results['audio_pos'])
+    mean_video_pos = np.mean(results['video_pos'])
+    mean_audio_neg = np.mean(results['audio_neg'])
+    mean_video_neg = np.mean(results['video_neg'])
+    mean_num_audio_tokens = np.mean(results['num_audio_tokens'])
+    
+ 
+    std_audio_abs = np.std(results['audio_abs'])
+    std_video_abs = np.std(results['video_abs'])
+ 
+    print(f"\nAggregate Results (n={len(results['audio_abs'])}):")
+    print(f"\nAbsolute SHAP:")
+    print(f"  Audio: {mean_audio_abs*100:.2f}% ± {std_audio_abs*100:.2f}%")
+    print(f"  Video: {mean_video_abs*100:.2f}% ± {std_video_abs*100:.2f}%")
+    print(f"\nPositive SHAP:")
+    print(f"  Audio: {mean_audio_pos*100:.2f}%")
+    print(f"  Video: {mean_video_pos*100:.2f}%")
+    print(f"\nNegative SHAP:")
+    print(f"  Audio: {mean_audio_neg*100:.2f}%")
+    print(f"  Video: {mean_video_neg*100:.2f}%")
+ 
+    wandb.log({
+        'audio-ABS-SHAP': mean_audio_abs,
+        'video-ABS-SHAP': mean_video_abs,
+        'audio-POS-SHAP': mean_audio_pos,
+        'video-POS-SHAP': mean_video_pos,
+        'audio-NEG-SHAP': mean_audio_neg,
+        'video-NEG-SHAP': mean_video_neg,
+        'audio-ABS-STD': std_audio_abs,
+        'video-ABS-STD': std_video_abs,
+        'WER': total_wer / num_processed
+    })
+
+
+@hydra.main(config_path="conf", config_name="s2s_decode", version_base="1.1")
+def hydra_main(cfg: DictConfig):
+    """Hydra entry point."""
+    main(cfg)
+
+
+if __name__ == "__main__":
+    hydra_main()
