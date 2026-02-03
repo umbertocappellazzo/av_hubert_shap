@@ -38,6 +38,36 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import argparse
+
+
+def parse_custom_args():
+    parser = argparse.ArgumentParser(description='SHAP analysis for AV-HuBERT')
+    parser.add_argument('--shap-alg', default='kernel', choices=['kernel', 'permutation'],
+                        help='SHAP algorithm')
+    parser.add_argument('--num-samples-shap', type=int, default=2000,
+                        help='Number of SHAP samples per evaluation')
+    parser.add_argument('--max-samples', type=int, default=None,
+                        help='Maximum number of samples to process')
+    parser.add_argument('--wandb-project', default=None, type=str, 
+                        help='WandB project name (if None, WandB disabled)')
+    parser.add_argument('--exp-name', default=None, type=str,
+                        help='WandB run name (auto-generated if None)')
+    parser.add_argument('--run-sanity-check', action='store_true',
+                        help='Run sanity checks on first sample')
+    
+    args, remaining = parser.parse_known_args()
+    
+    # Update sys.argv to only contain arguments Hydra should see
+    sys.argv = [sys.argv[0]] + remaining
+    
+    return args
+
+# Parse before importing Hydra
+CUSTOM_ARGS = parse_custom_args()
+    
+    
+
 import hydra
 from omegaconf import DictConfig, OmegaConf
 import editdistance
@@ -101,24 +131,12 @@ def compute_wer(hyp: str, ref: str) -> float:
 def main(cfg: DictConfig):
     """Main SHAP analysis function."""
     
-    # Parse additional arguments from command line
-    import argparse
-    parser = argparse.ArgumentParser(description='SHAP analysis for AV-HuBERT')
-    parser.add_argument('--shap-alg', default='kernel', choices=['kernel', 'permutation'],
-                        help='SHAP algorithm')
-    parser.add_argument('--num-samples-shap', type=int, default=2000,
-                        help='Number of SHAP samples per evaluation')
-    parser.add_argument('--max-samples', type=int, default=None,
-                        help='Maximum number of samples to process')
-    parser.add_argument('--wandb-project', default=None, type=str, 
-                        help='WandB project name (if None, WandB disabled)')
-    parser.add_argument('--exp-name', default=None, type=str,
-                        help='WandB run name (auto-generated if None)')
-    parser.add_argument('--run-sanity-check', action='store_true',
-                        help='Run sanity checks on first sample')
     
-    # Parse only known args since Hydra handles the rest
-    args, unknown = parser.parse_known_args()
+    # Use the pre-parsed custom arguments
+    args = CUSTOM_ARGS
+    
+    # Parse additional arguments from command line
+    
     
     wandb.init(
         project=args.wandb_project,
