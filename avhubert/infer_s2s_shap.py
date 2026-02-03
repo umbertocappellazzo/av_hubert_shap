@@ -49,7 +49,7 @@ from fairseq.dataclass.configs import FairseqConfig
 from fairseq.logging import progress_bar
 
 # Import SHAP utilities
-from vhubert_shap import (
+from hubert_shap import (
     forward_shap_avhubert,
     run_sanity_checks,
     extract_features_separate,
@@ -104,6 +104,8 @@ def main(cfg: DictConfig):
     # Parse additional arguments from command line
     import argparse
     parser = argparse.ArgumentParser(description='SHAP analysis for AV-HuBERT')
+    parser.add_argument('--shap-alg', default='kernel', choices=['kernel', 'permutation'],
+                        help='SHAP algorithm')
     parser.add_argument('--num-samples-shap', type=int, default=2000,
                         help='Number of SHAP samples per evaluation')
     parser.add_argument('--max-samples', type=int, default=None,
@@ -114,8 +116,6 @@ def main(cfg: DictConfig):
                         help='WandB run name (auto-generated if None)')
     parser.add_argument('--run-sanity-check', action='store_true',
                         help='Run sanity checks on first sample')
-    parser.add_argument('--save-raw-shap', action='store_true',
-                        help='Save raw SHAP values for each sample')
     
     # Parse only known args since Hydra handles the rest
     args, unknown = parser.parse_known_args()
@@ -233,6 +233,10 @@ def main(cfg: DictConfig):
                 bos_idx,
                 eos_idx,
                 n_shap_samples=args.num_samples_shap,
+                shap_alg=args.shap_alg,
+                device=str(device),
+                verbose=True,
+                debug=(sample_idx == 0)
             )
             
             # Get baseline transcription
