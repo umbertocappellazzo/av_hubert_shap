@@ -314,7 +314,7 @@ def main(cfg: DictConfig):
     })
 
 
-@hydra.main(config_path="conf", config_name="s2s_decode", version_base="1.1")
+@hydra.main(config_path="conf", config_name="s2s_decode")
 def hydra_main(cfg: DictConfig):
     """Hydra entry point."""
     main(cfg)
