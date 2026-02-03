@@ -33,7 +33,7 @@ import logging
 import math
 import time
 from dataclasses import dataclass, field
-from typing import Optional, List
+from typing import Optional, List, Any, Tuple, Union
 from pathlib import Path
 
 import numpy as np
@@ -75,7 +75,16 @@ import editdistance
 import wandb
 
 from fairseq import checkpoint_utils, options, tasks, utils
-from fairseq.dataclass.configs import FairseqConfig
+from fairseq.dataclass.configs import (
+    FairseqConfig,
+    FairseqDataclass,
+    CheckpointConfig,
+    CommonConfig,
+    CommonEvalConfig,
+    DatasetConfig,
+    DistributedTrainingConfig,
+    GenerationConfig,
+)
 from fairseq.logging import progress_bar
 
 # Import SHAP utilities
@@ -96,9 +105,28 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
-class InferConfig(FairseqConfig):
+class OverrideConfig(FairseqDataclass):
+    """Override configuration for data paths and noise settings."""
+    noise_wav: Optional[str] = field(default=None, metadata={'help': 'noise wav file'})
+    noise_prob: float = field(default=0, metadata={'help': 'noise probability'})
+    noise_snr: float = field(default=0, metadata={'help': 'noise SNR in audio'})
+    modalities: List[str] = field(default_factory=lambda: ["audio", "video"], metadata={'help': 'which modality to use'})
+    data: Optional[str] = field(default=None, metadata={'help': 'path to test data directory'})
+    label_dir: Optional[str] = field(default=None, metadata={'help': 'path to test label directory'})
+
+
+@dataclass
+class InferConfig(FairseqDataclass):
     """Configuration for SHAP inference."""
-    pass
+    task: Any = None
+    generation: GenerationConfig = field(default_factory=GenerationConfig)
+    common: CommonConfig = field(default_factory=CommonConfig)
+    common_eval: CommonEvalConfig = field(default_factory=CommonEvalConfig)
+    checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
+    distributed_training: DistributedTrainingConfig = field(default_factory=DistributedTrainingConfig)
+    dataset: DatasetConfig = field(default_factory=DatasetConfig)
+    override: OverrideConfig = field(default_factory=OverrideConfig)
+
 
 
 def get_symbols_to_strip_from_output(generator):
@@ -144,36 +172,31 @@ def main(cfg: DictConfig):
     )
     logger.info(f"WandB initialized: {args.wandb_project}")
     
-    # Setup task and model
-    if cfg.common.user_dir:
-        utils.import_user_module(cfg.common)
+    utils.import_user_module(cfg.common)
     
     logger.info(f"Loading model from: {cfg.common_eval.path}")
     
-    # Set modalities
-    if hasattr(cfg, 'override') and hasattr(cfg.override, 'modalities'):
-        modalities = list(cfg.override.modalities)
-    else:
-        modalities = ['audio', 'video']
+    models, saved_cfg, task = checkpoint_utils.load_model_ensemble_and_task([cfg.common_eval.path])
     
-    logger.info(f"Using modalities: {modalities}")
-    
-    # Load model ensemble and task
-    models, saved_cfg, task = checkpoint_utils.load_model_ensemble_and_task(
-        [cfg.common_eval.path],
-        arg_overrides={'modalities': modalities},
-        strict=False,
-    )
-    
+    # Move model to GPU and set to eval mode
+    use_cuda = torch.cuda.is_available()
+    models = [model.eval().cuda() if use_cuda else model.eval() for model in models]
     model = models[0]
-    model.eval()
+    device = torch.device('cuda' if use_cuda else 'cpu')
     
-    # Move to GPU if available
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = model.to(device)
     logger.info(f"Model loaded on device: {device}")
     
-    # Get dictionaries
+    # Set modalities from override config
+    saved_cfg.task.modalities = cfg.override.modalities
+    
+    # Setup task with saved config (this is crucial!)
+    task = tasks.setup_task(saved_cfg.task)
+    
+    # Build tokenizer and BPE
+    task.build_tokenizer(saved_cfg.tokenizer)
+    task.build_bpe(saved_cfg.bpe)
+    
+    # Get dictionary
     tgt_dict = task.target_dictionary
     bos_idx = tgt_dict.bos()
     eos_idx = tgt_dict.eos()
@@ -182,8 +205,25 @@ def main(cfg: DictConfig):
     logger.info(f"Vocabulary size: {len(tgt_dict)}")
     logger.info(f"BOS idx: {bos_idx}, EOS idx: {eos_idx}, PAD idx: {pad_idx}")
     
-    # Load dataset
-    task.load_dataset(cfg.dataset.gen_subset)
+    
+    # =========================================================================
+    # Dataset loading - MATCHING infer_s2s.py EXACTLY
+    # Apply overrides BEFORE loading dataset
+    # =========================================================================
+    
+    # Set noise parameters
+    task.cfg.noise_prob = cfg.override.noise_prob
+    task.cfg.noise_snr = cfg.override.noise_snr
+    task.cfg.noise_wav = cfg.override.noise_wav
+    
+    # Set data and label paths from overrides
+    if cfg.override.data is not None:
+        task.cfg.data = cfg.override.data
+    if cfg.override.label_dir is not None:
+        task.cfg.label_dir = cfg.override.label_dir
+    
+    # Load dataset with saved task config
+    task.load_dataset(cfg.dataset.gen_subset, task_cfg=saved_cfg.task)
     dataset = task.dataset(cfg.dataset.gen_subset)
     
     logger.info(f"Dataset loaded: {len(dataset)} samples")
