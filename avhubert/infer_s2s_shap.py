@@ -93,7 +93,7 @@ SHAP_ARGS = parse_shap_args()
 import wandb
 
 # Import SHAP utilities
-from avhubert_shap import (
+from hubert_shap import (
     forward_shap_avhubert,
     run_sanity_checks,
 )
