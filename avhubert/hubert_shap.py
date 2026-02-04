@@ -70,7 +70,7 @@ def extract_features_separate(
         # Extract features using the model's feature extractors
         features_audio = model.forward_features(src_audio, modality='audio')  # [B, F, T]
         features_video = model.forward_features(src_video, modality='video')  # [B, F, T]
-        features_video = torch.zeros_like(features_video)
+        #features_video = torch.zeros_like(features_video)
         
     
     # Validate outputs
