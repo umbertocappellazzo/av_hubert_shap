@@ -305,7 +305,7 @@ def _main(cfg, output_file):
                 padding_mask,
                 bos_idx,
                 eos_idx,
-                n_samples=args.num_samples_shap,
+                nsamples=args.num_samples_shap,
                 shap_alg=args.shap_alg,
                 device=str(device),
                 verbose=(sample_idx == 0),
