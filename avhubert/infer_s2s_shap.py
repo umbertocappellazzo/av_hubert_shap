@@ -27,22 +27,46 @@ Usage:
         --wandb-project avhubert-shap \
 """
 
-import os
-import sys
+import ast
+from itertools import chain
 import logging
 import math
-import time
-from dataclasses import dataclass, field
-from typing import Optional, List, Any, Tuple, Union
-from pathlib import Path
+import os
+import sys
+import json
+import hashlib
+import editdistance
+import argparse
+from argparse import Namespace
 
 import numpy as np
 import torch
-import argparse
+from fairseq import checkpoint_utils, options, tasks, utils, distributed_utils
+from fairseq.dataclass.utils import convert_namespace_to_omegaconf
+from fairseq.logging import progress_bar
+from fairseq.logging.meters import StopwatchMeter, TimeMeter
+from fairseq.models import FairseqLanguageModel
+from omegaconf import DictConfig
+
+from pathlib import Path
+import hydra
+from hydra.core.config_store import ConfigStore
+from fairseq.dataclass.configs import (
+    CheckpointConfig,
+    CommonConfig,
+    CommonEvalConfig,
+    DatasetConfig,
+    DistributedTrainingConfig,
+    GenerationConfig,
+    FairseqDataclass,
+)
+from dataclasses import dataclass, field, is_dataclass
+from typing import Any, Dict, List, Optional, Tuple, Union
+from omegaconf import OmegaConf
 
 
-def parse_custom_args():
-    parser = argparse.ArgumentParser(description='SHAP analysis for AV-HuBERT')
+def parse_shap_args():
+    parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument('--shap-alg', default='kernel', choices=['kernel', 'permutation'],
                         help='SHAP algorithm')
     parser.add_argument('--num-samples-shap', type=int, default=2000,
@@ -64,87 +88,65 @@ def parse_custom_args():
     return args
 
 # Parse before importing Hydra
-CUSTOM_ARGS = parse_custom_args()
+SHAP_ARGS = parse_shap_args()
     
-    
-
-import hydra
-from omegaconf import DictConfig, OmegaConf
-import editdistance
-
 import wandb
 
-from fairseq import checkpoint_utils, options, tasks, utils
-from fairseq.dataclass.configs import (
-    FairseqConfig,
-    FairseqDataclass,
-    CheckpointConfig,
-    CommonConfig,
-    CommonEvalConfig,
-    DatasetConfig,
-    DistributedTrainingConfig,
-    GenerationConfig,
-)
-from fairseq.logging import progress_bar
-
 # Import SHAP utilities
-from hubert_shap import (
+from avhubert_shap import (
     forward_shap_avhubert,
     run_sanity_checks,
-    extract_features_separate,
-    generate_baseline_greedy,
 )
 
-logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-    level=os.environ.get("LOGLEVEL", "INFO").upper(),
-    stream=sys.stdout,
-)
+logging.root.setLevel(logging.INFO)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+config_path = Path(__file__).resolve().parent / "conf"    
 
 
 @dataclass
 class OverrideConfig(FairseqDataclass):
-    """Override configuration for data paths and noise settings."""
     noise_wav: Optional[str] = field(default=None, metadata={'help': 'noise wav file'})
     noise_prob: float = field(default=0, metadata={'help': 'noise probability'})
     noise_snr: float = field(default=0, metadata={'help': 'noise SNR in audio'})
-    modalities: List[str] = field(default_factory=lambda: ["audio", "video"], metadata={'help': 'which modality to use'})
+    modalities: List[str] = field(default_factory=lambda: [""], metadata={'help': 'which modality to use'})
     data: Optional[str] = field(default=None, metadata={'help': 'path to test data directory'})
     label_dir: Optional[str] = field(default=None, metadata={'help': 'path to test label directory'})
 
-
 @dataclass
 class InferConfig(FairseqDataclass):
-    """Configuration for SHAP inference."""
     task: Any = None
-    generation: GenerationConfig = field(default_factory=GenerationConfig)
-    common: CommonConfig = field(default_factory=CommonConfig)
-    common_eval: CommonEvalConfig = field(default_factory=CommonEvalConfig)
-    checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
-    distributed_training: DistributedTrainingConfig = field(default_factory=DistributedTrainingConfig)
-    dataset: DatasetConfig = field(default_factory=DatasetConfig)
-    override: OverrideConfig = field(default_factory=OverrideConfig)
+    generation: GenerationConfig = GenerationConfig()
+    common: CommonConfig = CommonConfig()
+    common_eval: CommonEvalConfig = CommonEvalConfig()
+    checkpoint: CheckpointConfig = CheckpointConfig()
+    distributed_training: DistributedTrainingConfig = DistributedTrainingConfig()
+    dataset: DatasetConfig = DatasetConfig()
+    override: OverrideConfig = OverrideConfig()
+    is_ax: bool = field(
+        default=False,
+        metadata={
+            "help": "if true, assumes we are using ax for tuning and returns a tuple for ax to consume"
+        },
+    )
 
+
+def main(cfg: DictConfig):
+
+    if isinstance(cfg, Namespace):
+        cfg = convert_namespace_to_omegaconf(cfg)
+
+    assert cfg.common_eval.path is not None, "--path required for recognition!"
+
+    return _main(cfg, sys.stdout)
 
 
 def get_symbols_to_strip_from_output(generator):
-    """Get symbols to strip from decoder output."""
     if hasattr(generator, "symbols_to_strip_from_output"):
         return generator.symbols_to_strip_from_output
     else:
         return {generator.eos, generator.pad}
-
-
-def decode_fn(x, tgt_dict):
-    """Decode token indices to string."""
-    # Filter out special tokens
-    tokens = []
-    for tok in x:
-        if tok not in [tgt_dict.bos(), tgt_dict.eos(), tgt_dict.pad()]:
-            tokens.append(tok)
-    return tgt_dict.string(torch.tensor(tokens))
 
 
 def compute_wer(hyp: str, ref: str) -> float:
@@ -156,12 +158,19 @@ def compute_wer(hyp: str, ref: str) -> float:
     return 100 * editdistance.eval(hyp_words, ref_words) / len(ref_words)
 
 
-def main(cfg: DictConfig):
+def _main(cfg, output_file):
     """Main SHAP analysis function."""
     
+    logging.basicConfig(
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        level=os.environ.get("LOGLEVEL", "INFO").upper(),
+        stream=output_file,
+    )
+    logger = logging.getLogger("avhubert.shap_recognize")
     
     # Use the pre-parsed custom arguments
-    args = CUSTOM_ARGS
+    args = SHAP_ARGS
     
     # Parse additional arguments from command line
     
@@ -172,38 +181,38 @@ def main(cfg: DictConfig):
     )
     logger.info(f"WandB initialized: {args.wandb_project}")
     
+    
     utils.import_user_module(cfg.common)
     
     logger.info(f"Loading model from: {cfg.common_eval.path}")
     
     models, saved_cfg, task = checkpoint_utils.load_model_ensemble_and_task([cfg.common_eval.path])
     
-    # Move model to GPU and set to eval mode
-    use_cuda = torch.cuda.is_available()
-    models = [model.eval().cuda() if use_cuda else model.eval() for model in models]
-    model = models[0]
-    device = torch.device('cuda' if use_cuda else 'cpu')
-    
-    logger.info(f"Model loaded on device: {device}")
-    
-    # Set modalities from override config
+    models = [model.eval().cuda() for model in models]
     saved_cfg.task.modalities = cfg.override.modalities
-    
-    # Setup task with saved config (this is crucial!)
     task = tasks.setup_task(saved_cfg.task)
-    
-    # Build tokenizer and BPE
+
     task.build_tokenizer(saved_cfg.tokenizer)
     task.build_bpe(saved_cfg.bpe)
+
+    logger.info(cfg)
+    
+    # Move model to GPU and set to eval mode
+    # Fix seed
+    if cfg.common.seed is not None and not cfg.generation.no_seed_provided:
+        np.random.seed(cfg.common.seed)
+        utils.set_torch_seed(cfg.common.seed)
+
+    use_cuda = torch.cuda.is_available()
+    device = torch.device('cuda' if use_cuda else 'cpu')
     
     # Get dictionary
-    tgt_dict = task.target_dictionary
-    bos_idx = tgt_dict.bos()
-    eos_idx = tgt_dict.eos()
-    pad_idx = tgt_dict.pad()
+    dictionary = task.target_dictionary
+    bos_idx = dictionary.bos()
+    eos_idx = dictionary.eos()
+    pad_idx = dictionary.pad()
     
-    logger.info(f"Vocabulary size: {len(tgt_dict)}")
-    logger.info(f"BOS idx: {bos_idx}, EOS idx: {eos_idx}, PAD idx: {pad_idx}")
+    logger.info(f"Vocabulary size: {len(dictionary)}, BOS: {bos_idx}, EOS: {eos_idx}, PAD: {pad_idx}")
     
     
     # =========================================================================
@@ -224,6 +233,9 @@ def main(cfg: DictConfig):
     
     # Load dataset with saved task config
     task.load_dataset(cfg.dataset.gen_subset, task_cfg=saved_cfg.task)
+    
+    # Get model
+    model = models[0]
     dataset = task.dataset(cfg.dataset.gen_subset)
     
     logger.info(f"Dataset loaded: {len(dataset)} samples")
@@ -234,6 +246,19 @@ def main(cfg: DictConfig):
         num_samples = min(num_samples, args.max_samples)
     
     logger.info(f"Processing {num_samples} samples with {args.num_samples_shap} SHAP samples each")
+    logger.info(f"SHAP algorithm: {args.shap_alg}")
+    
+    
+    # =========================================================================
+    # Decode function - from infer_s2s.py
+    # =========================================================================
+    def decode_fn(x):
+        if hasattr(task.datasets[cfg.dataset.gen_subset].label_processors[0], 'decode'):
+            symbols_ignore = {eos_idx, pad_idx}
+            return task.datasets[cfg.dataset.gen_subset].label_processors[0].decode(x, symbols_ignore)
+        chars = dictionary.string(x, extra_symbols_to_ignore={eos_idx, pad_idx})
+        words = " ".join("".join(chars.split()).replace('|', ' ').split())
+        return words
     
     results = {
         'audio_abs': [],
@@ -245,8 +270,6 @@ def main(cfg: DictConfig):
         'num_audio_tokens': [],
         'shapley_values': [],
     }
-    total_wer = 0.
-    num_processed = 0
     
     # Process samples one by one (SHAP requires batch_size=1)
     for sample_idx in range(num_samples):
@@ -263,19 +286,11 @@ def main(cfg: DictConfig):
             # Extract source and target
             source = batch['net_input']['source']
             padding_mask = batch['net_input'].get('padding_mask', None)
-            target_tokens = batch.get('target', None)
             
-            # Get reference text if available
-            if target_tokens is not None:
-                ref_text = decode_fn(target_tokens[0], tgt_dict)
-            else:
-                ref_text = ""
-            
-            # Run sanity check on first sample if requested
             if args.run_sanity_check and sample_idx == 0:
                 logger.info("Running sanity checks...")
                 sanity_results = run_sanity_checks(
-                    model, source, padding_mask, bos_idx, eos_idx
+                    model, source, padding_mask, bos_idx, eos_idx, debug=True
                 )
                 logger.info(f"Sanity check results: {sanity_results}")
             
@@ -290,20 +305,15 @@ def main(cfg: DictConfig):
                 padding_mask,
                 bos_idx,
                 eos_idx,
-                n_shap_samples=args.num_samples_shap,
+                n_samples=args.num_samples_shap,
                 shap_alg=args.shap_alg,
                 device=str(device),
-                verbose=True,
+                verbose=(sample_idx == 0),
                 debug=(sample_idx == 0)
             )
             
-            # Get baseline transcription
-            hyp_text = decode_fn(torch.tensor(baseline_tokens), tgt_dict) if len(baseline_tokens) > 0 else ""
             
             # Compute WER
-            wer = compute_wer(hyp_text, ref_text)
-            total_wer += wer
-            num_processed += 1
             
             # Store results
             results['audio_abs'].append(audio_abs)
@@ -368,49 +378,45 @@ def main(cfg: DictConfig):
         'video-NEG-SHAP': mean_video_neg,
         'audio-ABS-STD': std_audio_abs,
         'video-ABS-STD': std_video_abs,
-        'WER': total_wer / num_processed
     })
 
-config_path = Path(__file__).resolve().parent / "conf"
-@hydra.main(config_path=str(config_path), config_name="s2s_decode")
-def hydra_main(cfg: InferConfig) -> None:
-    """Hydra entry point."""
-    from hydra.core.config_store import ConfigStore
-    from dataclasses import is_dataclass
-    
+@hydra.main(config_path=config_path, config_name="s2s_decode")
+def hydra_main(cfg: InferConfig) -> Union[float, Tuple[float, Optional[float]]]:
     container = OmegaConf.to_container(cfg, resolve=True, enum_to_str=True)
     cfg = OmegaConf.create(container)
     OmegaConf.set_struct(cfg, True)
-    
+
     try:
-        main(cfg)
-    except Exception as e:
-        logger.error(f"Error: {e}")
-        import traceback
-        traceback.print_exc()
-        raise
+        if cfg.common.profile:
+            with torch.cuda.profiler.profile():
+                with torch.autograd.profiler.emit_nvtx():
+                    distributed_utils.call_main(cfg, main)
+        else:
+            distributed_utils.call_main(cfg, main)
+    except BaseException as e:
+        if not cfg.common.suppress_crashes:
+            raise
+        else:
+            logger.error("Crashed! %s", str(e))
+    return
 
 
 def cli_main() -> None:
-    """CLI entry point with ConfigStore setup."""
-    from hydra.core.config_store import ConfigStore
-    from dataclasses import is_dataclass
-    
     try:
         from hydra._internal.utils import get_args
         cfg_name = get_args().config_name or "s2s_decode"
     except ImportError:
         logger.warning("Failed to get config name from hydra args")
         cfg_name = "s2s_decode"
-    
+
     cs = ConfigStore.instance()
     cs.store(name=cfg_name, node=InferConfig)
-    
+
     for k in InferConfig.__dataclass_fields__:
         if is_dataclass(InferConfig.__dataclass_fields__[k].type):
             v = InferConfig.__dataclass_fields__[k].default
             cs.store(name=k, node=v)
-    
+
     hydra_main()
 
 
