@@ -79,6 +79,7 @@ def parse_shap_args():
                         help='WandB run name (auto-generated if None)')
     parser.add_argument('--run-sanity-check', action='store_true',
                         help='Run sanity checks on first sample')
+    parser.add_argument('--output-path', default=None, type=str)
     
     args, remaining = parser.parse_known_args()
     
@@ -299,7 +300,7 @@ def _main(cfg, output_file):
             (audio_abs, video_abs,
              audio_pos, video_pos,
              audio_neg, video_neg,
-             shapley_values, baseline_tokens) = forward_shap_avhubert(
+             num_audio_tokens, shapley_values) = forward_shap_avhubert(
                 model,
                 source,
                 padding_mask,
@@ -323,6 +324,7 @@ def _main(cfg, output_file):
             results['audio_neg'].append(audio_neg)
             results['video_neg'].append(video_neg)
             results['shapley_values'].append(shapley_values)
+            results['num_audio_tokens'].append(num_audio_tokens)
             
             wandb.log({
                 'sample_idx': sample_idx,
@@ -332,6 +334,7 @@ def _main(cfg, output_file):
                 'sample_video_pos': video_pos,
                 'sample_audio_neg': audio_neg,
                 'sample_video_neg': video_neg,
+                'sample_num_audio_tokens': num_audio_tokens
             })
             
         
@@ -378,7 +381,32 @@ def _main(cfg, output_file):
         'video-NEG-SHAP': mean_video_neg,
         'audio-ABS-STD': std_audio_abs,
         'video-ABS-STD': std_video_abs,
+        'num-audio-tokens': mean_num_audio_tokens
     })
+    
+    
+    output_file = os.path.join(
+        args.output_path,
+        args.exp_name
+        
+    )
+    
+    print("Output dir: ", output_file)
+
+    np.savez_compressed(
+            output_file,
+            # Aggregated metrics
+            audio_abs=np.array(results['audio_abs']),
+            video_abs=np.array(results['video_abs']),
+            audio_pos=np.array(results['audio_pos']),
+            video_pos=np.array(results['video_pos']),
+            audio_neg=np.array(results['audio_neg']),
+            video_neg=np.array(results['video_neg']),
+            num_audio_tokens=np.array(results['num_audio_tokens']),
+            
+            # Raw SHAP values (ragged array - stored as object array)
+            shap_values=np.array(results['shapley_values'], dtype=object),
+        )
 
 @hydra.main(config_path=config_path, config_name="s2s_decode")
 def hydra_main(cfg: InferConfig) -> Union[float, Tuple[float, Optional[float]]]:
