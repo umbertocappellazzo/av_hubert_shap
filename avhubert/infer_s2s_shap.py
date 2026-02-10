@@ -337,8 +337,6 @@ def _main(cfg, output_file):
                 'sample_num_audio_tokens': num_audio_tokens
             })
             
-            print("Num audio tokens: ", num_audio_tokens)
-            
             print(f"\nSample {sample_idx + 1}:")
             print(f"  Absolute - Audio: {audio_abs*100:.2f}%, Video: {video_abs*100:.2f}%")
             
@@ -376,6 +374,8 @@ def _main(cfg, output_file):
     print(f"\nNegative SHAP:")
     print(f"  Audio: {mean_audio_neg*100:.2f}%")
     print(f"  Video: {mean_video_neg*100:.2f}%")
+    
+    
  
     wandb.log({
         'audio-ABS-SHAP': mean_audio_abs,
@@ -412,6 +412,8 @@ def _main(cfg, output_file):
             # Raw SHAP values (ragged array - stored as object array)
             shap_values=np.array(results['shapley_values'], dtype=object),
         )
+    
+    print("Num audio tokens: ", mean_num_audio_tokens)
 
 @hydra.main(config_path=config_path, config_name="s2s_decode")
 def hydra_main(cfg: InferConfig) -> Union[float, Tuple[float, Optional[float]]]:
