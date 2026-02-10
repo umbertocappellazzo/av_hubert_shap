@@ -337,6 +337,7 @@ def _main(cfg, output_file):
                 'sample_num_audio_tokens': num_audio_tokens
             })
             
+            print("Num audio tokens: ", num_audio_tokens)
             
             print(f"\nSample {sample_idx + 1}:")
             print(f"  Absolute - Audio: {audio_abs*100:.2f}%, Video: {video_abs*100:.2f}%")
