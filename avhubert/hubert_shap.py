@@ -442,10 +442,6 @@ def forward_shap_avhubert(
         Tuple of:
             - audio_pct_abs: Audio contribution (% of total absolute SHAP)
             - video_pct_abs: Video contribution (% of total absolute SHAP)
-            - audio_pct_pos: Audio contribution (% of total positive SHAP)
-            - video_pct_pos: Video contribution (% of total positive SHAP)
-            - audio_pct_neg: Audio contribution (% of total negative SHAP)
-            - video_pct_neg: Video contribution (% of total negative SHAP)
             - T: Number of time steps
             - vals: Raw SHAP values array (p, T_tokens)
     """
@@ -553,7 +549,7 @@ def forward_shap_avhubert(
     if verbose or debug:
         print(f"\n[4] Computing SHAP with {nsamples} samples using {shap_alg}...")
     
-    if shap_alg == "kernel":
+    if shap_alg == "sampling":
         explainer = shap.SamplingExplainer(
             model=shap_model,
             data=background,
@@ -644,29 +640,9 @@ def forward_shap_avhubert(
     audio_pct_abs = mm_audio_abs / total_abs
     video_pct_abs = mm_video_abs / total_abs
     
-    # Positive SHAP
-    mm_raw_pos = np.sum(np.maximum(vals, 0), axis=1)
-    mm_audio_pos = mm_raw_pos[:N_a].sum()
-    mm_video_pos = mm_raw_pos[N_a:].sum()
-    total_pos = mm_audio_pos + mm_video_pos
-    
-    audio_pct_pos = mm_audio_pos / total_pos
-    video_pct_pos = mm_video_pos / total_pos
-    
-    # Negative SHAP
-    mm_raw_neg = np.sum(np.abs(np.minimum(vals, 0)), axis=1)
-    mm_audio_neg = mm_raw_neg[:N_a].sum()
-    mm_video_neg = mm_raw_neg[N_a:].sum()
-    total_neg = mm_audio_neg + mm_video_neg
-    
-    audio_pct_neg = mm_audio_neg / total_neg
-    video_pct_neg = mm_video_neg / total_neg
-    
     if verbose or debug:
         print(f"\n[7] Final Results:")
         print(f"  Absolute - Audio: {audio_pct_abs*100:.2f}%, Video: {video_pct_abs*100:.2f}%")
-        print(f"  Positive - Audio: {audio_pct_pos*100:.2f}%, Video: {video_pct_pos*100:.2f}%")
-        print(f"  Negative - Audio: {audio_pct_neg*100:.2f}%, Video: {video_pct_neg*100:.2f}%")
     
     if debug:
         print("="*80)
@@ -675,8 +651,6 @@ def forward_shap_avhubert(
     
     return (
         audio_pct_abs, video_pct_abs,
-        audio_pct_pos, video_pct_pos,
-        audio_pct_neg, video_pct_neg,
         T, vals
     )
 
