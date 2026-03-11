@@ -1,4 +1,4 @@
-## Shapley Value computations for Auto-AVSR
+## Shapley Value computations for AV-HuBERT
 
 This repository contains the code to compute the audio/video SHAP contributions for the AV-HuBERT model. For more details, please refer to our [`paper`](??). 
 
